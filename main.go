@@ -5,9 +5,10 @@ import (
 	filehandler "CameraFileCopy/fileHandler"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log"
 	"os"
-	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -55,19 +56,35 @@ func runCopy(cliArgs *args.CliArgs) {
 	var copyWg sync.WaitGroup
 	copyChannel := make(chan filehandler.Result, cliArgs.MaxItens)
 
-	files, err := os.ReadDir(cliArgs.OrigDir)
+	err := filepath.WalkDir(cliArgs.OrigDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			log.Printf("Error accessing path %q: %v", path, err)
+			return nil
+		}
+
+		relPath, err := filepath.Rel(cliArgs.OrigDir, path)
+		if err != nil {
+			log.Printf("Error getting relative path: %v", err)
+			return nil
+		}
+
+		destPath := filepath.Join(cliArgs.DestDir, relPath)
+
+		if d.IsDir() {
+			if err := os.MkdirAll(destPath, 0755); err != nil {
+				log.Printf("Error creating directory %s: %v", destPath, err)
+			}
+			return nil
+		}
+
+		copyWg.Add(1)
+		go filehandler.CopyFile(path, destPath, &copyWg, copyChannel)
+		return nil
+	})
 
 	if err != nil {
-		log.Printf("Error reading directory: %v", err)
+		log.Printf("Error walking directory: %v", err)
 		return
-	}
-
-	fmt.Println("****** Start copy process ******")
-	for _, f := range files {
-		if !f.IsDir() {
-			copyWg.Add(1)
-			go filehandler.CopyFile(path.Join(cliArgs.OrigDir, f.Name()), path.Join(cliArgs.DestDir, f.Name()), &copyWg, copyChannel)
-		}
 	}
 
 	go func() {
@@ -95,24 +112,33 @@ func runClean(cliArgs *args.CliArgs) {
 	cleanChannel := make(chan filehandler.Result, cliArgs.MaxItens)
 
 	fmt.Println("****** Start clean process ******")
-	files, err := os.ReadDir(cliArgs.OrigDir)
-	if err != nil {
-		log.Fatalf("Error reading directory: %v", err)
-	}
-
 	cutoffTime := time.Now().AddDate(0, 0, -cliArgs.DaysOld)
 
-	for _, f := range files {
-		fi, e := f.Info()
-		if e != nil {
-			log.Printf("Error getting file info for %s: %v", f.Name(), e)
-			continue
+	err := filepath.WalkDir(cliArgs.OrigDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			log.Printf("Error accessing path %q: %v", path, err)
+			return nil
 		}
 
-		if !fi.IsDir() && fi.ModTime().Before(cutoffTime) {
-			cleanWg.Add(1)
-			go filehandler.RemoveFile(path.Join(cliArgs.OrigDir, f.Name()), &cleanWg, cleanChannel)
+		if d.IsDir() {
+			return nil
 		}
+
+		fi, err := d.Info()
+		if err != nil {
+			log.Printf("Error getting file info for %s: %v", path, err)
+			return nil
+		}
+
+		if fi.ModTime().Before(cutoffTime) {
+			cleanWg.Add(1)
+			go filehandler.RemoveFile(path, &cleanWg, cleanChannel)
+		}
+		return nil
+	})
+
+	if err != nil {
+		log.Printf("Error walking directory: %v", err)
 	}
 
 	go func() {
